@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -244,8 +245,14 @@ func (s *HTTPServer) serve(conn net.Conn) {
 	if err != nil {
 		// io.EOF means the client closed before sending any byte (a port
 		// probe or health check), which is not worth a log line. A request
-		// cut short is io.ErrUnexpectedEOF and is still logged.
-		if err != io.EOF {
+		// cut short is io.ErrUnexpectedEOF and is still logged. A read
+		// deadline timeout is a slow or idle client, logged at debug only.
+		var ne net.Error
+		switch {
+		case err == io.EOF:
+		case errors.As(err, &ne) && ne.Timeout():
+			debugf("read request failed: %s\n", err)
+		default:
 			log.Printf("read request failed: %s\n", err)
 		}
 		return

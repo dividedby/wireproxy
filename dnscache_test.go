@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -452,6 +453,49 @@ func TestTunnelDialSystemDNS(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "cannot marshal DNS message") {
 		t.Fatalf("hostname was resolved by netstack instead of the system resolver: %v", err)
+	}
+}
+
+// RoutedDial must send tunnelled hosts through tunnelDial, so the DNS cache is
+// consulted. The name below does not resolve anywhere: if RoutedDial bypassed
+// tunnelDial (dialing through netstack directly) the dial would fail with a
+// lookup error, whereas a cache hit dials the seeded address through the
+// unconnected tunnel and runs into the dial timeout.
+func TestRoutedDialUsesDNSCache(t *testing.T) {
+	tun, tnet, err := netstack.CreateNetTUN([]netip.Addr{netip.MustParseAddr("10.0.0.2")}, nil, 1420)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tun.Close() }()
+	// netstack blocks on writing packets that nothing reads
+	go func() {
+		bufs, sizes := [][]byte{make([]byte, 2048)}, []int{0}
+		for {
+			if _, err := tun.Read(bufs, sizes, 0); err != nil {
+				return
+			}
+		}
+	}()
+
+	const host = "seeded.invalid"
+	cache := newDNSCache(time.Minute)
+	seed := func(context.Context, string) ([]string, error) { return []string{"10.9.9.9"}, nil }
+	if _, err := cache.lookup(context.Background(), host, seed); err != nil {
+		t.Fatal(err)
+	}
+
+	old := routedDialTimeout
+	routedDialTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { routedDialTimeout = old })
+
+	vt := VirtualTun{Tnet: tnet, SystemDNS: true, cache: cache}
+	router := NewDomainRouter([]*regexp.Regexp{regexp.MustCompile(`^seeded\.invalid$`)}, false)
+	_, err = vt.RoutedDial(router)("tcp4", net.JoinHostPort(host, "80"))
+	if err == nil {
+		t.Fatal("expected the dial through an unconnected tunnel to fail")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected the seeded address to be dialled until the timeout, got: %v", err)
 	}
 }
 

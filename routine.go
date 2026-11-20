@@ -191,7 +191,8 @@ func (d VirtualTun) RoutedDial(router *DomainRouter) func(network, address strin
 // routedDialTimeout bounds a dial made by RoutedDial. Without it a dead tunnel
 // or target makes the caller wait for the TCP SYN retries (about two minutes in
 // netstack).
-const routedDialTimeout = 30 * time.Second
+// It is a variable so tests can shorten it.
+var routedDialTimeout = 30 * time.Second
 
 type dialContextFunc func(ctx context.Context, network, address string) (net.Conn, error)
 
