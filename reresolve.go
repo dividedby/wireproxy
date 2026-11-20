@@ -2,7 +2,6 @@ package wireproxy
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"net/netip"
 	"strconv"
@@ -123,7 +122,7 @@ func reresolveEndpoints(dev ipcDevice, peers []PeerConfig, resolve func(string) 
 			errorLogger.Printf("Failed to update endpoint of %s: %s\n", peer.EndpointRaw, err.Error())
 			continue
 		}
-		log.Printf("Endpoint %s changed from %s to %s\n", peer.EndpointRaw, status.endpoint, endpoint)
+		infof("Endpoint %s changed from %s to %s\n", peer.EndpointRaw, status.endpoint, endpoint)
 	}
 }
 
