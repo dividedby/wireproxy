@@ -1,10 +1,15 @@
 package wireproxy
 
 import (
+	"crypto/ecdh"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -27,9 +32,12 @@ func TestHandshakeRecords(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	maxAge := 2 * time.Minute
 	ipc := func(a, b int64) string {
-		return fmt.Sprintf("private_key=aa\npublic_key=%s\nlast_handshake_time_sec=%d\nlast_handshake_time_nsec=0\n"+
-			"public_key=%s\nlast_handshake_time_sec=%d\nlast_handshake_time_nsec=0\n", handshakeHexA, a, handshakeHexB, b)
+		return fmt.Sprintf("private_key=aa\npublic_key=%s\nendpoint=192.0.2.1:51820\nlast_handshake_time_sec=%d\nlast_handshake_time_nsec=0\n"+
+			"public_key=%s\nendpoint=192.0.2.2:51820\nlast_handshake_time_sec=%d\nlast_handshake_time_nsec=0\n", handshakeHexA, a, handshakeHexB, b)
 	}
+
+	endpoint := "192.0.2.1:51820"
+	peers := []PeerConfig{{PublicKey: handshakeHexA, Endpoint: &endpoint}, {PublicKey: handshakeHexB, Endpoint: &endpoint}}
 
 	tests := []struct {
 		name      string
@@ -44,7 +52,7 @@ func TestHandshakeRecords(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			records, stale := handshakeRecords(tt.ipc, maxAge, now)
+			records, stale := handshakeRecords(tt.ipc, peers, maxAge, now)
 			if stale != tt.wantStale {
 				t.Fatalf("stale = %v, want %v", stale, tt.wantStale)
 			}
@@ -54,12 +62,41 @@ func TestHandshakeRecords(t *testing.T) {
 		})
 	}
 
-	if records, stale := handshakeRecords("private_key=aa\n", maxAge, now); stale || len(records) != 0 {
+	if records, stale := handshakeRecords("private_key=aa\n", peers, maxAge, now); stale || len(records) != 0 {
 		t.Fatalf("no peers should not be stale, got %v %v", stale, records)
 	}
+
+	t.Run("peer without a configured endpoint is skipped", func(t *testing.T) {
+		// B has no Endpoint in the config and never handshook, but wireguard
+		// reports an endpoint for it (as it does for one learned from a packet).
+		// Only A counts, and B stays in the records, flagged as skipped.
+		records, stale := handshakeRecords(ipc(now.Unix()-10, 0), peers[:1], maxAge, now)
+		if stale {
+			t.Fatal("a peer without a configured endpoint must not make the check stale")
+		}
+		want := map[string]uint64{handshakeKeyA: uint64(now.Unix() - 10), handshakeKeyB: 0, "handshake_skipped:" + strings.TrimPrefix(handshakeKeyB, "handshake:"): 1}
+		if !maps.Equal(records, want) {
+			t.Fatalf("records = %v, want %v", records, want)
+		}
+	})
+
+	t.Run("config key may be base64", func(t *testing.T) {
+		b64 := &PeerConfig{PublicKey: strings.TrimPrefix(handshakeKeyA, "handshake:"), Endpoint: &endpoint}
+		_, stale := handshakeRecords(ipc(0, now.Unix()-10), []PeerConfig{*b64, peers[1]}, maxAge, now)
+		if !stale {
+			t.Fatal("a base64 config key must match the hex key in the IPC output")
+		}
+	})
 }
 
 func newReadyzTun(t *testing.T, maxHandshakeAge int) VirtualTun {
+	t.Helper()
+	return newReadyzTunPeer(t, maxHandshakeAge, true)
+}
+
+// newReadyzTunPeer returns a tun with one peer. The IPC peer always has an endpoint;
+// configuredEndpoint says whether the configuration has one too.
+func newReadyzTunPeer(t *testing.T, maxHandshakeAge int, configuredEndpoint bool) VirtualTun {
 	t.Helper()
 	tun, _, err := netstack.CreateNetTUN([]netip.Addr{netip.MustParseAddr("10.0.0.2")}, nil, 1420)
 	if err != nil {
@@ -69,14 +106,23 @@ func newReadyzTun(t *testing.T, maxHandshakeAge int) VirtualTun {
 	t.Cleanup(dev.Close)
 
 	// The device is not brought up, so no handshake can ever happen.
-	request := "private_key=" + handshakeHexB + "\npublic_key=" + handshakeHexA + "\n" + "allowed_ip=0.0.0.0/0\n"
+	endpoint := "192.0.2.1:51820"
+	request := "private_key=" + handshakeHexB + "\npublic_key=" + handshakeHexA + "\n" +
+		"endpoint=" + endpoint + "\nallowed_ip=0.0.0.0/0\n"
 	if err := dev.IpcSet(request); err != nil {
 		t.Fatal(err)
 	}
 
+	conf := &DeviceConfig{CheckAliveInterval: 5, MaxHandshakeAge: maxHandshakeAge}
+	peer := PeerConfig{PublicKey: handshakeHexA}
+	if configuredEndpoint {
+		peer.Endpoint = &endpoint
+	}
+	conf.Peers = []PeerConfig{peer}
+
 	return VirtualTun{
 		Dev:            dev,
-		Conf:           &DeviceConfig{CheckAliveInterval: 5, MaxHandshakeAge: maxHandshakeAge},
+		Conf:           conf,
 		PingRecord:     make(map[string]uint64),
 		PingRecordLock: new(sync.Mutex),
 	}
@@ -101,6 +147,106 @@ func TestReadyzMaxHandshakeAge(t *testing.T) {
 			t.Fatalf("unexpected body %q", rec.Body.String())
 		}
 	})
+
+	t.Run("peer without a configured endpoint is skipped", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		newReadyzTunPeer(t, 120, false).ServeHTTP(rec, httptest.NewRequest("GET", "/readyz", nil))
+		want := `{"` + handshakeKeyA + `":0,"handshake_skipped:` + strings.TrimPrefix(handshakeKeyA, "handshake:") + `":1}`
+		if rec.Code != http.StatusOK || strings.TrimSpace(rec.Body.String()) != want {
+			t.Fatalf("got %d %q, want 200 %q", rec.Code, rec.Body.String(), want)
+		}
+	})
+}
+
+// TestReadyzFreshHandshake brings up two wireguard devices over loopback and
+// expects /readyz of the initiator to turn 200 once they have handshaked. Only the
+// endpoint is loopback: wireguard-go's default bind listens on all interfaces, and
+// there is no option to restrict it.
+func TestReadyzFreshHandshake(t *testing.T) {
+	keyHex := func(seed byte) (private, public string) {
+		raw := make([]byte, 32)
+		raw[1] = seed
+		key, err := ecdh.X25519().NewPrivateKey(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return hex.EncodeToString(raw), hex.EncodeToString(key.PublicKey().Bytes())
+	}
+	newDev := func() (*device.Device, *netstack.Net) {
+		tun, tnet, err := netstack.CreateNetTUN([]netip.Addr{netip.MustParseAddr("10.0.0.2")}, nil, 1420)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, ""))
+		t.Cleanup(dev.Close)
+		return dev, tnet
+	}
+
+	privA, pubA := keyHex(1)
+	privB, pubB := keyHex(2)
+
+	devB, _ := newDev()
+	if err := devB.IpcSet("private_key=" + privB + "\nlisten_port=0\npublic_key=" + pubA + "\nallowed_ip=0.0.0.0/0\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := devB.Up(); err != nil {
+		t.Fatal(err)
+	}
+	ipc, err := devB.IpcGet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var portB string
+	for _, line := range strings.Split(ipc, "\n") {
+		if v, ok := strings.CutPrefix(line, "listen_port="); ok {
+			portB = v
+		}
+	}
+	if _, err := strconv.Atoi(portB); err != nil {
+		t.Fatalf("no listen_port in %q", ipc)
+	}
+
+	endpoint := "127.0.0.1:" + portB
+	devA, _ := newDev()
+	if err := devA.IpcSet("private_key=" + privA + "\nlisten_port=0\npublic_key=" + pubB +
+		"\nendpoint=" + endpoint + "\npersistent_keepalive_interval=1\nallowed_ip=0.0.0.0/0\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := devA.Up(); err != nil {
+		t.Fatal(err)
+	}
+
+	tun := VirtualTun{
+		Dev:            devA,
+		Conf:           &DeviceConfig{CheckAliveInterval: 5, MaxHandshakeAge: 120, Peers: []PeerConfig{{PublicKey: pubB, Endpoint: &endpoint}}},
+		PingRecord:     make(map[string]uint64),
+		PingRecordLock: new(sync.Mutex),
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		rec := httptest.NewRecorder()
+		tun.ServeHTTP(rec, httptest.NewRequest("GET", "/readyz", nil))
+		if rec.Code == http.StatusOK {
+			var body map[string]uint64
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if len(body) != 1 {
+				t.Fatalf("unexpected body %q", rec.Body.String())
+			}
+			for _, sec := range body {
+				if sec == 0 {
+					t.Fatalf("200 with an empty handshake time: %q", rec.Body.String())
+				}
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no fresh handshake within 10s, last got %d %q", rec.Code, rec.Body.String())
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func TestMaxHandshakeAgeConfig(t *testing.T) {
