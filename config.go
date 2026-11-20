@@ -39,6 +39,9 @@ type DeviceConfig struct {
 	// EndpointReresolveInterval is how often, in seconds, peers with a hostname
 	// endpoint are checked for a stale handshake. 0 disables re-resolving.
 	EndpointReresolveInterval int
+	// MaxHandshakeAge is the age, in seconds, of the last handshake of a peer
+	// after which /readyz reports unavailable. 0 disables the check.
+	MaxHandshakeAge int
 }
 
 type UDPProxyTunnelConfig struct {
@@ -343,6 +346,18 @@ func ParseInterface(cfg *ini.File, device *DeviceConfig) error {
 		}
 
 		device.EndpointReresolveInterval = value
+	}
+
+	if sectionKey, err := section.GetKey("MaxHandshakeAge"); err == nil {
+		value, err := sectionKey.Int()
+		if err != nil {
+			return err
+		}
+		if value < 0 {
+			return errors.New("MaxHandshakeAge should not be negative")
+		}
+
+		device.MaxHandshakeAge = value
 	}
 
 	return nil
